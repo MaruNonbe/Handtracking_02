@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>Hand Landmark Debug</title>
+<title>Hand Tracking WebAR – Back Camera Locked</title>
 <style>
-  html,body{margin:0;padding:0;overflow:hidden;background:#000}
+  html,body{margin:0;padding:0;background:#000;overflow:hidden}
   #video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
-  #debug{position:fixed;inset:0;pointer-events:none}
+  canvas{position:fixed;inset:0;pointer-events:none}
   .ui{position:fixed;left:8px;top:8px;display:flex;gap:8px;z-index:10}
   .ui button{padding:6px 10px;border:0;border-radius:6px;background:#222;color:#fff}
   .hint{position:fixed;left:8px;bottom:8px;color:#fff;font:14px/1.6 system-ui;background:rgba(0,0,0,.35);padding:6px 10px;border-radius:8px}
-  .err{position:fixed;left:8px;right:8px;top:48px;color:#fff;background:#b00020;padding:8px 12px;border-radius:8px;display:none;white-space:pre-wrap}
+  .err{position:fixed;left:8px;right:8px;top:48px;color:#fff;background:#b00020;padding:8px 12px;border-radius:8px;display:none;white-space:pre-wrap;z-index:11}
 </style>
 </head>
 <body>
@@ -22,83 +22,193 @@
     <button id="backBtn">背面</button>
   </div>
   <div id="err" class="err"></div>
-  <div class="hint">手全体を30〜60cmの距離で映してください（緑点=検出）。明るい場所で。</div>
+  <div class="hint">背面カメラ固定版。手を30〜60cm、明るい場所で。ピンチ位置にGLBが出ます。</div>
 
-  <!-- MediaPipe Hands -->
+  <!-- Three.js -->
+  <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.160.0/examples/js/loaders/GLTFLoader.js"></script>
+
+  <!-- MediaPipe Hands (旧JS版) -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
 <script>
 (async ()=>{
   const $ = s=>document.querySelector(s);
-  const err = $("#err");
-  const showErr = m=>{ err.textContent=m; err.style.display='block'; console.error(m); };
+  const video = $('#video');
+  const dbg = $('#debug'); const ctx = dbg.getContext('2d');
+  const errBox = $('#err');
+  const showErr = m=>{ errBox.textContent=m; errBox.style.display='block'; console.error(m); };
+  const hideErr = ()=>{ errBox.style.display='none'; };
 
-  const video = $("#video");
-  const dbg = $("#debug");
-  const ctx = dbg.getContext('2d');
-  const state = { facing: 'environment' }; // 起動時は背面
+  let currentStream = null;
+  let currentDeviceId = null;
 
-  async function openCamera() {
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal: state.facing } }, audio:false });
-      return s;
-    } catch(e) {
-      if (state.facing==='environment') {
-        showErr('背面が使えないため前面にフォールバックしました。');
-        state.facing = 'user';
-        return await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user' }, audio:false });
-      } else {
-        throw e;
-      }
+  // --- 1) カメラ取得：deviceId で固定 ---
+  async function stopStream(){
+    if(currentStream){
+      currentStream.getTracks().forEach(t=>t.stop());
+      currentStream = null;
     }
   }
 
-  async function startStream(){
-    const stream = await openCamera();
+  function isBackLabel(label){
+    // iOS例: "Back Dual Wide Camera", "Back Triple Camera"
+    // Android例: "camera 0, facing back"
+    return /(back|rear|environment|wide|tele|外側|背面)/i.test(label) && !/front|true ?depth/i.test(label);
+  }
+
+  async function listVideoInputs(){
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter(d=>d.kind === 'videoinput');
+  }
+
+  async function ensurePermissionOnce(){
+    // ラベルを得るには一度でも許可が必要なブラウザがある
+    if(!(await navigator.mediaDevices.enumerateDevices()).some(d=>d.label)){
+      const tmp = await navigator.mediaDevices.getUserMedia({video:true, audio:false});
+      tmp.getTracks().forEach(t=>t.stop());
+    }
+  }
+
+  async function openCameraByDeviceId(deviceId){
+    await stopStream();
+    const constraints = { video: { deviceId: { exact: deviceId } }, audio:false };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    currentStream = stream;
+    currentDeviceId = deviceId;
     video.srcObject = stream;
     await video.play();
     resize();
-    startHands();
   }
 
+  async function openPreferred(facing){ // 'back' | 'front'
+    hideErr();
+    try{
+      await ensurePermissionOnce();
+      const cams = await listVideoInputs();
+      let target = null;
+
+      if(facing === 'back'){
+        // まずラベルで背面候補
+        target = cams.find(c=>isBackLabel(c.label));
+        // 見つからなければ index 0/最後のヒューリスティック
+        if(!target) target = cams[cams.length-1] || cams[0];
+      }else{
+        // 前面候補
+        target = cams.find(c=>/front|内側/i.test(c.label)) || cams[0];
+      }
+
+      if(!target) throw new Error('カメラデバイスが見つかりません。');
+
+      await openCameraByDeviceId(target.deviceId);
+    }catch(e){
+      showErr('カメラ起動エラー：' + e.message);
+    }
+  }
+
+  // 端末のデバイス変更（回転・外部接続等）でも背面を維持
+  navigator.mediaDevices.addEventListener?.('devicechange', async ()=>{
+    if(currentDeviceId){
+      // 同じdeviceIdがまだ存在するか確認
+      const cams = await listVideoInputs();
+      if(!cams.some(c=>c.deviceId === currentDeviceId)){
+        // 消えた場合は背面優先で再取得
+        await openPreferred('back');
+      }
+    }
+  });
+
+  // --- 2) Three.js ---
+  const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+  renderer.setPixelRatio(devicePixelRatio);
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 100);
+  camera.position.set(0,0,1.5);
+  scene.add(new THREE.AmbientLight(0xffffff,.7));
+  const dl = new THREE.DirectionalLight(0xffffff,1); dl.position.set(0,1,1); scene.add(dl);
+
   function resize(){
+    renderer.setSize(innerWidth, innerHeight);
+    camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
     dbg.width = innerWidth; dbg.height = innerHeight;
   }
   addEventListener('resize', resize);
 
-  // Buttons
-  $("#frontBtn").onclick = async ()=>{ state.facing='user'; await startStream(); };
-  $("#backBtn").onclick  = async ()=>{ state.facing='environment'; await startStream(); };
+  // GLB
+  const MODEL_URL = 'model.glb';
+  const loader = new THREE.GLTFLoader();
+  let model = new THREE.Group(); scene.add(model); model.visible=false;
+  loader.load(MODEL_URL, (gltf)=>{
+    model.add(gltf.scene);
+    const box = new THREE.Box3().setFromObject(model);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const center = new THREE.Vector3(); box.getCenter(center);
+    model.position.sub(center);
+    const maxDim = Math.max(size.x,size.y,size.z)||1;
+    model.userData.baseScale = 0.15/maxDim;
+    model.scale.setScalar(model.userData.baseScale);
+    console.log('GLB loaded');
+  }, undefined, (e)=>showErr('GLB読み込み失敗: '+e));
 
-  // MediaPipe Hands
+  // --- 3) MediaPipe Hands（自前ループ） ---
   const hands = new Hands({ locateFile: f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
   hands.setOptions({
     maxNumHands:1, modelComplexity:1,
-    selfieMode: false, // 背面前提（前面に切替時は左右反転を気にしないデバッグ用途）
+    selfieMode:false, // 背面前提
     minTrackingConfidence:0.6, minDetectionConfidence:0.6
   });
 
-  function drawPt(x,y,r=5,color='#00ff68'){ ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fillStyle=color; ctx.fill(); }
-
-  function startHands(){
-    const cam = new Camera(video, {
-      onFrame: async ()=>{ await hands.send({ image: video }); },
-      width: 640, height: 480
-    });
-    cam.start();
-  }
+  const Z = 0.6;
+  let latestLandmarks = null;
 
   hands.onResults((res)=>{
     ctx.clearRect(0,0,dbg.width,dbg.height);
     const lm = res.multiHandLandmarks?.[0];
-    if(!lm) return;
-    lm.forEach(p=>{
-      drawPt(p.x*dbg.width, p.y*dbg.height, 4, '#00ff68');
-    });
+    latestLandmarks = lm || null;
+
+    // デバッグ点（緑）
+    if(lm){
+      lm.forEach(p=>{
+        ctx.beginPath(); ctx.arc(p.x*dbg.width, p.y*dbg.height, 3, 0, Math.PI*2);
+        ctx.fillStyle = '#00ff68'; ctx.fill();
+      });
+    }
   });
 
-  try { await startStream(); }
-  catch(e){ showErr(String(e)); }
+  async function tick(){
+    if(video.readyState >= 2){
+      await hands.send({ image: video });
+      if(latestLandmarks){
+        const t = latestLandmarks[4], i = latestLandmarks[8];
+        const u = (t.x+i.x)/2, v=(t.y+i.y)/2;
+        const ndcX = u*2-1, ndcY=(1-v)*2-1;
+        const vec = new THREE.Vector3(ndcX, ndcY, -1).unproject(camera);
+        const dir = vec.sub(camera.position).normalize();
+        const pos = camera.position.clone().add(dir.multiplyScalar(Z));
+        model.position.copy(pos);
+        model.visible = true;
+        // ピンチ距離で演出
+        const pinch = Math.hypot(t.x-i.x, t.y-i.y);
+        const factor = (pinch < 0.05) ? 1.15 : 1.0;
+        model.scale.setScalar(model.userData.baseScale * factor);
+      }else{
+        model.visible = false;
+      }
+    }
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  }
+
+  // UI
+  $('#frontBtn').onclick = ()=>openPreferred('front');
+  $('#backBtn').onclick  = ()=>openPreferred('back');
+
+  // 起動：背面優先で固定
+  await openPreferred('back');
+  requestAnimationFrame(tick);
 })();
 </script>
 </body>
