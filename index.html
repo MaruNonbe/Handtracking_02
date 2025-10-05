@@ -1,179 +1,105 @@
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Hand Tracking WebAR (Back Camera + GLB follow)</title>
-  <style>
-    html,body{margin:0;padding:0;background:#000;overflow:hidden}
-    #video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
-    canvas{position:fixed;inset:0}
-    .hint{position:fixed;left:8px;bottom:8px;color:#fff;font:14px/1.6 system-ui;background:rgba(0,0,0,.35);padding:6px 10px;border-radius:8px}
-    .err{position:fixed;left:8px;top:8px;right:8px;color:#fff;background:#b00020;padding:8px 12px;border-radius:8px;display:none;white-space:pre-wrap}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Hand Landmark Debug</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#000}
+  #video{position:fixed;inset:0;width:100vw;height:100vh;object-fit:cover}
+  #debug{position:fixed;inset:0;pointer-events:none}
+  .ui{position:fixed;left:8px;top:8px;display:flex;gap:8px;z-index:10}
+  .ui button{padding:6px 10px;border:0;border-radius:6px;background:#222;color:#fff}
+  .hint{position:fixed;left:8px;bottom:8px;color:#fff;font:14px/1.6 system-ui;background:rgba(0,0,0,.35);padding:6px 10px;border-radius:8px}
+  .err{position:fixed;left:8px;right:8px;top:48px;color:#fff;background:#b00020;padding:8px 12px;border-radius:8px;display:none;white-space:pre-wrap}
+</style>
 </head>
 <body>
   <video id="video" playsinline muted></video>
-  <div class="hint">背面カメラで動作中。親指と人差し指を近づけるとGLBが手元に出ます。</div>
+  <canvas id="debug"></canvas>
+  <div class="ui">
+    <button id="frontBtn">前面</button>
+    <button id="backBtn">背面</button>
+  </div>
   <div id="err" class="err"></div>
-
-  <!-- Three.js -->
-  <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
-  <!-- GLTFLoader（非モジュール版） -->
-  <script src="https://unpkg.com/three@0.160.0/examples/js/loaders/GLTFLoader.js"></script>
+  <div class="hint">手全体を30〜60cmの距離で映してください（緑点=検出）。明るい場所で。</div>
 
   <!-- MediaPipe Hands -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script>
+(async ()=>{
+  const $ = s=>document.querySelector(s);
+  const err = $("#err");
+  const showErr = m=>{ err.textContent=m; err.style.display='block'; console.error(m); };
 
-  <script>
-  (async () => {
-    const showError = (m) => { const el = document.getElementById('err'); el.textContent = m; el.style.display = 'block'; console.error(m); };
+  const video = $("#video");
+  const dbg = $("#debug");
+  const ctx = dbg.getContext('2d');
+  const state = { facing: 'environment' }; // 起動時は背面
 
-    // === 1) カメラ（背面優先・フォールバック付き） ===
-    const video = document.getElementById('video');
-    async function openCamera() {
-      try {
-        // 背面カメラを「理想」として要求
-        const s1 = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' } },
-          audio: false
-        });
-        return s1;
-      } catch(e1) {
-        try {
-          // 一部端末は exact 指定で通ることがある
-          const s2 = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: { exact: 'environment' } },
-            audio: false
-          });
-          return s2;
-        } catch(e2) {
-          // 最後の手段：前面
-          const s3 = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: 'user' },
-            audio: false
-          });
-          showError('背面カメラが使用できなかったため、前面にフォールバックしました。端末やブラウザの設定をご確認ください。');
-          return s3;
-        }
+  async function openCamera() {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal: state.facing } }, audio:false });
+      return s;
+    } catch(e) {
+      if (state.facing==='environment') {
+        showErr('背面が使えないため前面にフォールバックしました。');
+        state.facing = 'user';
+        return await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user' }, audio:false });
+      } else {
+        throw e;
       }
     }
+  }
+
+  async function startStream(){
     const stream = await openCamera();
     video.srcObject = stream;
     await video.play();
+    resize();
+    startHands();
+  }
 
-    // === 2) Three.js ===
-    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    document.body.appendChild(renderer.domElement);
+  function resize(){
+    dbg.width = innerWidth; dbg.height = innerHeight;
+  }
+  addEventListener('resize', resize);
 
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.01, 100);
-    camera.position.set(0,0,1.5);
+  // Buttons
+  $("#frontBtn").onclick = async ()=>{ state.facing='user'; await startStream(); };
+  $("#backBtn").onclick  = async ()=>{ state.facing='environment'; await startStream(); };
 
-    const dir = new THREE.DirectionalLight(0xffffff, 1); dir.position.set(0,1,1); scene.add(dir);
-    scene.add(new THREE.AmbientLight(0xffffff, .6));
+  // MediaPipe Hands
+  const hands = new Hands({ locateFile: f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+  hands.setOptions({
+    maxNumHands:1, modelComplexity:1,
+    selfieMode: false, // 背面前提（前面に切替時は左右反転を気にしないデバッグ用途）
+    minTrackingConfidence:0.6, minDetectionConfidence:0.6
+  });
 
-    window.addEventListener('resize', () => {
-      camera.aspect = window.innerWidth/window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-    });
+  function drawPt(x,y,r=5,color='#00ff68'){ ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fillStyle=color; ctx.fill(); }
 
-    // === 3) GLB 読み込み ===
-    // 日本語名でもOK（GitHub Pagesでは英字名 model.glb を推奨）
-    const MODEL_URL = encodeURI('無題.glb');
-    const loader = new THREE.GLTFLoader();
-    let model = new THREE.Group();
-    scene.add(model);
-    model.visible = false;
-
-    loader.load(
-      MODEL_URL,
-      (gltf) => {
-        model.add(gltf.scene);
-
-        // 中心合わせ＆スケーリング
-        const box = new THREE.Box3().setFromObject(model);
-        const size = new THREE.Vector3(); box.getSize(size);
-        const center = new THREE.Vector3(); box.getCenter(center);
-        model.position.sub(center);
-
-        const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        const targetDim = 0.15; // ≒15cm
-        const s = targetDim / maxDim;
-        model.scale.setScalar(s);
-        model.visible = false;
-        console.log('GLB loaded');
-      },
-      undefined,
-      (err) => showError('GLBの読み込みに失敗しました：' + err)
-    );
-
-    // === 4) MediaPipe Hands（背面前提：selfieMode=false） ===
-    const hands = new Hands({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-    });
-    hands.setOptions({
-      maxNumHands: 1,
-      modelComplexity: 1,
-      selfieMode: false,            // ← 重要：鏡像OFF（背面）
-      minTrackingConfidence: 0.6,
-      minDetectionConfidence: 0.6
-    });
-
-    const Z = 0.6; // カメラ前方の仮想距離（m相当）
-    let pinchActive = false;
-
-    hands.onResults((results) => {
-      const lm = results.multiHandLandmarks?.[0];
-      if (!lm || !model) { model.visible = false; return; }
-
-      const thumbTip = lm[4];
-      const indexTip = lm[8];
-
-      // ピンチ距離で掴み判定
-      const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
-      pinchActive = pinchDist < 0.05;
-
-      // 親指先と人差し指先の中点（画像座標 0..1）
-      const u = (thumbTip.x + indexTip.x) * 0.5; // 0..1（左→右）
-      const v = (thumbTip.y + indexTip.y) * 0.5; // 0..1（上→下）
-
-      // === 背面用のNDC変換 ===
-      const ndcX = (u * 2 - 1);
-      const ndcY = ((1 - v) * 2 - 1); // 上を+にする
-
-      // 画面位置をカメラ前方Zへ投影
-      const vec = new THREE.Vector3(ndcX, ndcY, -1).unproject(camera);
-      const ray = vec.sub(camera.position).normalize();
-      const pos = camera.position.clone().add(ray.multiplyScalar(Z));
-
-      model.position.copy(pos);
-      model.visible = true;
-
-      // 掴み中は少しスケールUP（演出）
-      const base = model.userData._baseScale || model.scale.x;
-      if (!model.userData._baseScale) model.userData._baseScale = base;
-      const factor = pinchActive ? 1.15 : 1.0;
-      model.scale.setScalar(base * factor);
-    });
-
-    // === 5) MediaPipe にフレームを渡す ===
-    const mpCamera = new Camera(video, {
-      onFrame: async () => { await hands.send({ image: video }); },
+  function startHands(){
+    const cam = new Camera(video, {
+      onFrame: async ()=>{ await hands.send({ image: video }); },
       width: 640, height: 480
     });
-    mpCamera.start();
+    cam.start();
+  }
 
-    // === 6) ループ ===
-    (function loop(){
-      renderer.render(scene, camera);
-      requestAnimationFrame(loop);
-    })();
-  })();
-  </script>
+  hands.onResults((res)=>{
+    ctx.clearRect(0,0,dbg.width,dbg.height);
+    const lm = res.multiHandLandmarks?.[0];
+    if(!lm) return;
+    lm.forEach(p=>{
+      drawPt(p.x*dbg.width, p.y*dbg.height, 4, '#00ff68');
+    });
+  });
+
+  try { await startStream(); }
+  catch(e){ showErr(String(e)); }
+})();
+</script>
 </body>
 </html>
